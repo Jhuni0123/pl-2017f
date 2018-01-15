@@ -114,6 +114,25 @@ let subst_scheme : subst -> typ_scheme -> typ_scheme = fun subs tyscm ->
 let subst_env : subst -> typ_env -> typ_env = fun subs tyenv ->
   List.map (fun (x, tyscm) -> (x, subst_scheme subs tyscm)) tyenv
 
+(*
+open Pp
+let nl = print_newline
+let ps = print_string
+let pe = M_Printer.print_exp
+let rec st t =
+  match t with
+  | TInt -> "int"
+  | TBool -> "bool"
+  | TString -> "string"
+  | TVar a -> "V-" ^ a
+  | TVarIBSL a -> "V-IBSL-" ^ a
+  | TVarIBS a -> "V-IBS-" ^ a
+  | TFun (t1, t2) -> "(" ^ (st t1) ^ ") -> " ^ (st t2)
+  | TLoc t -> "loc (" ^ (st t) ^ ")"
+  | TPair (t1, t2) -> "(" ^ (st t1) ^ "," ^ (st t2) ^ ")"
+let pt t = print_string (st t)
+*)
+
 let subst_genvar : typ_scheme -> typ = fun tyscm ->
   match tyscm with
   | SimpleTyp t -> t
@@ -125,7 +144,6 @@ let subst_genvar : typ_scheme -> typ = fun tyscm ->
           empty_subst alphas betas
       in
       s' t
-
 
 let rec include_var t x =
   match t with
@@ -176,18 +194,17 @@ let rec expansive : M.exp -> bool = fun e ->
   | M.APP _ -> true
   | M.LET (M.VAL (x, e1), e2) -> expansive e1 || expansive e2
   | M.LET (M.REC (f, x, e), e2) -> expansive e2
-  | _ -> true
-  (*| M.IF (e1, e2, e3) -> expansive e1 || expansive e2 || expansive e3
+  | M.IF (e1, e2, e3) -> expansive e1 || expansive e2 || expansive e3
   | M.BOP (_, e1, e2) -> expansive e1 || expansive e2
   | M.READ -> false
   | M.WRITE e -> expansive e
   | M.MALLOC _ -> true
-  | M.ASSIGN _ -> true
+  | M.ASSIGN (e1, e2) -> expansive e1 || expansive e2
   | M.BANG e -> expansive e
   | M.SEQ (e1, e2) -> expansive e1 || expansive e2
   | M.PAIR (e1, e2) -> expansive e1 || expansive e2
   | M.FST e -> expansive e
-  | M.SND e -> expansive e*)
+  | M.SND e -> expansive e
 
 let rec infer_M : typ_env * M.exp * typ -> subst = fun (tyenv, exp, t) ->
   match exp with
@@ -300,6 +317,118 @@ let rec infer_M : typ_env * M.exp * typ -> subst = fun (tyenv, exp, t) ->
       let b = new_var () in
       infer_M (tyenv, e, TPair (TVar b, t))
 
+let rec infer_W : typ_env * M.exp -> subst * typ = fun (tyenv, e) ->
+  match e with
+  | M.CONST (M.N n) -> (empty_subst, TInt)
+  | M.CONST (M.S s) -> (empty_subst, TString)
+  | M.CONST (M.B b) -> (empty_subst, TBool)
+  | M.VAR x -> (empty_subst, subst_genvar (List.assoc x tyenv))
+  | M.FN (x, e) ->
+      let b = new_var () in
+      let (s1, t1) = infer_W ((x, SimpleTyp (TVar b))::tyenv, e) in
+      (s1, TFun (s1 (TVar b), t1))
+  | M.APP (e1, e2) ->
+      let (s1, t1) = infer_W (tyenv, e1) in
+      let (s2, t2) = infer_W (subst_env s1 tyenv, e2) in
+      let b = new_var () in
+      let s3 = unify (s2 t1, TFun (t2, TVar b)) in
+      (s3 @@ s2 @@ s1, s3 (TVar b))
+  | M.LET (M.VAL (x, e1), e2) ->
+      let (s1, t1) = infer_W (tyenv, e1) in
+      let tyenv' = subst_env s1 tyenv in
+      let tx =
+        if expansive e1 then SimpleTyp t1
+        else generalize tyenv' t1
+      in
+      let (s2, t2) = infer_W ((x, tx)::tyenv', e2) in
+      (s2 @@ s1, t2)
+  | M.LET (M.REC (f, x, e), e2) ->
+      let e1 = M.FN (x, e) in
+      let b = new_var () in
+      let (s1, t1) = infer_W ((f, SimpleTyp (TVar b))::tyenv, e1) in
+      let s2 = unify (t1, s1 (TVar b)) in
+      let t2 = s2 t1 in
+      let tyenv' = subst_env (s2 @@ s1) tyenv in
+      let (s3, t3) = infer_W ((f, generalize tyenv' t2)::tyenv', e2) in
+      (s3 @@ s2 @@ s1, t3)
+  | M.IF (e_cond, e_true, e_false) ->
+      let (s1, t_cond) = infer_W (tyenv, e_cond) in
+      let s2 = unify (t_cond, TBool) in
+      let tyenv' = subst_env (s2 @@ s1) tyenv in
+      let (s3, t_true) = infer_W (tyenv', e_true) in
+      let tyenv'' = subst_env s3 tyenv' in
+      let (s4, t_false) = infer_W (tyenv'', e_false) in
+      let s5 = unify (s4 t_true, t_false) in
+      (s5 @@ s4 @@ s3 @@ s2 @@ s1, s5 t_false)
+  | M.BOP (M.ADD, e1, e2)
+  | M.BOP (M.SUB, e1, e2) ->
+      let (s1, t1) = infer_W (tyenv, e1) in
+      let s1' = unify (t1, TInt) in
+      let tyenv' = subst_env (s1' @@ s1) tyenv in
+      let (s2, t2) = infer_W (tyenv', e2) in
+      let s2' = unify (t2, TInt) in
+      (s2' @@ s2 @@ s1' @@ s1, TInt)
+  | M.BOP (M.AND, e1, e2)
+  | M.BOP (M.OR, e1, e2) ->
+      let (s1, t1) = infer_W (tyenv, e1) in
+      let s1' = unify (t1, TBool) in
+      let tyenv' = subst_env (s1' @@ s1) tyenv in
+      let (s2, t2) = infer_W (tyenv', e2) in
+      let s2' = unify (t2, TBool) in
+      (s2' @@ s2 @@ s1' @@ s1, TBool)
+  | M.BOP (M.EQ, e1, e2) ->
+      let (s1, t1) = infer_W (tyenv, e1) in
+      let b = new_var () in
+      let s1' = unify (t1, TVarIBSL b) in
+      let tyenv' = subst_env (s1' @@ s1) tyenv in
+      let (s2, t2) = infer_W (tyenv', e2) in
+      let s2' = unify (t2, (s2 @@ s1') t1) in
+      (s2' @@ s2 @@ s1' @@ s1, TBool)
+  | M.READ -> (empty_subst, TInt)
+  | M.WRITE e ->
+      let (s1, t1) = infer_W (tyenv, e) in
+      let b = new_var () in
+      let s2 = unify (t1, TVarIBS b) in
+      (s2 @@ s1, s2 t1)
+  | M.MALLOC e ->
+      let (s1, t1) = infer_W (tyenv, e) in
+      (s1, TLoc t1)
+  | M.ASSIGN (e1, e2) ->
+      let (s1, t1) = infer_W (tyenv, e1) in
+      let b = new_var () in
+      let s1' = unify (t1, TLoc (TVar b)) in
+      let tyenv' = subst_env (s1' @@ s1) tyenv in
+      let (s2, t2) = infer_W (tyenv', e2) in
+      let s2' = unify (t2, (s2 @@ s1') (TVar b)) in
+      (s2' @@ s2 @@ s1' @@ s1, s2' t2)
+  | M.BANG e ->
+      let (s1, t1) = infer_W (tyenv, e) in
+      let b = new_var () in
+      let s2 = unify (t1, TLoc (TVar b)) in
+      (s2 @@ s1, s2 (TVar b))
+  | M.SEQ (e1, e2) ->
+      let (s1, t1) = infer_W (tyenv, e1) in
+      let tyenv' = subst_env s1 tyenv in
+      let (s2, t2) = infer_W (tyenv', e2) in
+      (s2 @@ s1, t2)
+  | M.PAIR (e1, e2) ->
+      let (s1, t1) = infer_W (tyenv, e1) in
+      let tyenv' = subst_env s1 tyenv in
+      let (s2, t2) = infer_W (tyenv', e2) in
+      (s2 @@ s1, TPair (s2 t1, t2))
+  | M.FST e ->
+      let (s1, t1) = infer_W (tyenv, e) in
+      let b1 = new_var () in
+      let b2 = new_var () in
+      let s2 = unify (t1, TPair (TVar b1, TVar b2)) in
+      (s2 @@ s1, s2 (TVar b1))
+  | M.SND e ->
+      let (s1, t1) = infer_W (tyenv, e) in
+      let b1 = new_var () in
+      let b2 = new_var () in
+      let s2 = unify (t1, TPair (TVar b1, TVar b2)) in
+      (s2 @@ s1, s2 (TVar b2))
+
 let rec convert : typ -> M.typ = fun t ->
   match t with
   | TInt -> M.TyInt
@@ -309,8 +438,14 @@ let rec convert : typ -> M.typ = fun t ->
   | TLoc t -> M.TyLoc (convert t)
   | _ -> raise (M.TypeError "Invalid result type")
 
-let check : M.exp -> M.typ = fun e ->
+let check_M : M.exp -> typ = fun e ->
   let x = new_var () in
   let s = infer_M ([], e, TVar x) in
-  let t = s (TVar x) in
-  convert t
+  s (TVar x)
+
+let check_W : M.exp -> typ = fun e ->
+  let (s, t) = infer_W ([], e) in
+  t
+
+let check : M.exp -> M.typ = fun e ->
+  convert (check_M e) (* check_M or check_W *)
